@@ -2,10 +2,13 @@
 """
 Google Ads MCP Server - FastMCP Implementation
 Simplified for use with OpenAI Agent Builder (no external MCP auth).
-Provides tools for:
-- listing accessible accounts
-- getting keyword performance (get_search_keywords)
-- getting search terms (get_search_terms)
+
+Tools:
+- list_accounts
+- get_search_keywords
+- get_search_terms
+- generate_keyword_ideas        (Seed-Begriffe -> Keyword-Ideen + Suchvolumen)
+- get_keyword_search_volume     (Keywords -> Suchvolumen + Metriken)
 """
 
 import os
@@ -37,7 +40,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google_ads_mcp")
 
 SCOPES = ["https://www.googleapis.com/auth/adwords"]
-API_VERSION = "v20"  # adjust if you need a newer Google Ads API version
+API_VERSION = "v20"  # ggf. anpassen falls du eine andere Version nutzen willst
 
 
 def initialize_credentials() -> Credentials:
@@ -196,7 +199,7 @@ def mcp_health_status() -> str:
         "auth_method": "none",
         "google_ads_connected": _credentials is not None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": "1.0.0-minimal",
+        "version": "1.0.0-keywords",
     }
     return json.dumps(status, indent=2)
 
@@ -242,7 +245,10 @@ async def get_search_keywords(
     ),
     days: int = Field(default=7, description="Number of days to look back"),
 ) -> str:
-    """Get keyword performance overview for the given customer and date range."""
+    """
+    Holt Keyword-Performance für bestehende Keywords im Konto (kein Generator).
+    Nutzt GAQL auf keyword_view.
+    """
     query = f"""
         SELECT
             ad_group_criterion.keyword.text,
@@ -273,7 +279,9 @@ async def get_search_terms(
     ),
     days: int = Field(default=7, description="Number of days to look back"),
 ) -> str:
-    """Get search terms (actual user queries) for the given customer and date range."""
+    """
+    Holt tatsächliche Suchbegriffe (Search Terms Report) für ein Konto.
+    """
     query = f"""
         SELECT
             search_term_view.search_term,
@@ -295,6 +303,175 @@ async def get_search_terms(
     return _execute_gaql_query_internal(customer_id, query)
 
 
+@mcp.tool()
+async def generate_keyword_ideas(
+    seed_keywords: list[str] = Field(
+        description="Liste von Begriffen/Keywords, aus denen neue Keyword-Ideen mit Suchvolumen generiert werden sollen."
+    ),
+    language_id: str = Field(
+        default="1000",
+        description="Language Constant ID, z. B. 1000 für Deutsch."
+    ),
+    location_ids: list[str] = Field(
+        default=["2760"],
+        description="Liste von GeoTarget-IDs, z. B. 2760 für Deutschland."
+    ),
+) -> str:
+    """
+    Nutzt den Google Ads KeywordPlanIdeaService.generateKeywordIdeas-Endpunkt, um
+    aus seed_keywords neue Keyword-Ideen zu erzeugen und direkt Suchvolumen + Metriken
+    zurückzugeben. Customer-ID wird intern aus der Umgebung gelesen und
+    ist von außen nicht sichtbar.
+    """
+    try:
+        creds = get_credentials()
+        headers = get_headers(creds)
+
+        # Customer-ID nur intern benutzen, niemals nach außen geben
+        customer_id = os.environ.get("GOOGLE_ADS_KEYWORD_CUSTOMER_ID") or os.environ.get(
+            "GOOGLE_ADS_LOGIN_CUSTOMER_ID"
+        )
+        if not customer_id:
+            raise ToolError(
+                "Es ist keine Customer-ID gesetzt. Lege in Railway GOOGLE_ADS_KEYWORD_CUSTOMER_ID oder GOOGLE_ADS_LOGIN_CUSTOMER_ID an."
+            )
+
+        formatted_customer_id = format_customer_id(customer_id)
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}:generateKeywordIdeas"
+
+        language_resource = f"languageConstants/{language_id}"
+        geo_resources = [f"geoTargetConstants/{loc_id}" for loc_id in location_ids]
+
+        body = {
+            "language": language_resource,
+            "geoTargetConstants": geo_resources,
+            "keywordSeed": {
+                "keywords": seed_keywords
+            }
+        }
+
+        response = requests.post(url, headers=headers, json=body)
+        if response.status_code != 200:
+            raise ToolError(f"Fehler bei generateKeywordIdeas: {response.text}")
+
+        data = response.json()
+        results = data.get("results", [])
+
+        if not results:
+            return "Für diese Eingaben wurden keine Keyword-Ideen gefunden."
+
+        lines: list[str] = []
+        for res in results:
+            text = res.get("text")
+            metrics = res.get("keywordIdeaMetrics", {}) or {}
+
+            avg_monthly = metrics.get("avgMonthlySearches")
+            competition = metrics.get("competition")
+            low_bid = metrics.get("lowTopOfPageBidMicros")
+            high_bid = metrics.get("highTopOfPageBidMicros")
+
+            lines.append(
+                f"Keyword-Idee: {text}\n"
+                f"  Durchschnittl. monatliche Suchanfragen: {avg_monthly}\n"
+                f"  Wettbewerb (enum): {competition}\n"
+                f"  Low Top of Page Bid (Micros): {low_bid}\n"
+                f"  High Top of Page Bid (Micros): {high_bid}\n"
+            )
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        raise ToolError(f"Fehler in generate_keyword_ideas: {str(e)}")
+
+
+@mcp.tool()
+async def get_keyword_search_volume(
+    keywords: list[str] = Field(
+        description="Liste von Keywords, für die explizit Suchvolumen & Metriken ausgegeben werden sollen."
+    ),
+    language_id: str = Field(
+        default="1000",
+        description="Language Constant ID, z. B. 1000 für Deutsch."
+    ),
+    location_ids: list[str] = Field(
+        default=["2760"],
+        description="Liste von GeoTarget-IDs, z. B. 2760 für Deutschland."
+    ),
+) -> str:
+    """
+    Holt für eine konkrete Liste von Keywords das jeweilige Suchvolumen und
+    relevante Metriken. Intern wird generateKeywordIdeas verwendet,
+    danach aber auf genau die übergebenen Keywords gefiltert.
+    """
+    try:
+        creds = get_credentials()
+        headers = get_headers(creds)
+
+        customer_id = os.environ.get("GOOGLE_ADS_KEYWORD_CUSTOMER_ID") or os.environ.get(
+            "GOOGLE_ADS_LOGIN_CUSTOMER_ID"
+        )
+        if not customer_id:
+            raise ToolError(
+                "Es ist keine Customer-ID gesetzt. Lege in Railway GOOGLE_ADS_KEYWORD_CUSTOMER_ID oder GOOGLE_ADS_LOGIN_CUSTOMER_ID an."
+            )
+
+        formatted_customer_id = format_customer_id(customer_id)
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}:generateKeywordIdeas"
+
+        language_resource = f"languageConstants/{language_id}"
+        geo_resources = [f"geoTargetConstants/{loc_id}" for loc_id in location_ids]
+
+        body = {
+            "language": language_resource,
+            "geoTargetConstants": geo_resources,
+            "keywordSeed": {
+                "keywords": keywords
+            }
+        }
+
+        response = requests.post(url, headers=headers, json=body)
+        if response.status_code != 200:
+            raise ToolError(f"Fehler bei generateKeywordIdeas: {response.text}")
+
+        data = response.json()
+        results = data.get("results", [])
+
+        if not results:
+            return "Für diese Keywords wurden keine Daten gefunden."
+
+        # Set für exakte Filterung auf unsere Eingabe-Keywords
+        keyword_set = {k.lower().strip() for k in keywords}
+        lines: list[str] = []
+
+        for res in results:
+            text_raw = res.get("text") or ""
+            text = text_raw.lower().strip()
+            if text not in keyword_set:
+                continue
+
+            metrics = res.get("keywordIdeaMetrics", {}) or {}
+            avg_monthly = metrics.get("avgMonthlySearches")
+            competition = metrics.get("competition")
+            low_bid = metrics.get("lowTopOfPageBidMicros")
+            high_bid = metrics.get("highTopOfPageBidMicros")
+
+            lines.append(
+                f"Keyword: {text_raw}\n"
+                f"  Durchschnittl. monatliche Suchanfragen: {avg_monthly}\n"
+                f"  Wettbewerb (enum): {competition}\n"
+                f"  Low Top of Page Bid (Micros): {low_bid}\n"
+                f"  High Top of Page Bid (Micros): {high_bid}\n"
+            )
+
+        if not lines:
+            return "Für die angegebenen Keywords wurden keine exakten Volumen-Daten gefunden."
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        raise ToolError(f"Fehler in get_keyword_search_volume: {str(e)}")
+
+
 # -----------------------------------------------------
 # Main entrypoint
 # -----------------------------------------------------
@@ -303,7 +480,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
 
     logger.info("=" * 60)
-    logger.info("🚀 Starting Google Ads MCP Server (minimal keywords version)")
+    logger.info("🚀 Starting Google Ads MCP Server (keywords edition)")
     logger.info(f"📍 Port: {port}")
     logger.info(f"🌐 Base URL (informational): {base_url}")
     logger.info("=" * 60)
