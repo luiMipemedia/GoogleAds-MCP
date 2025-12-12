@@ -394,8 +394,8 @@ async def get_keyword_search_volume(
         description="Language Constant ID, z. B. 1000 für Deutsch."
     ),
     location_ids: list[str] = Field(
-        default=["2760"],
-        description="Liste von GeoTarget-IDs, z. B. 2760 für Deutschland."
+        default=["2276"],
+        description="Liste von GeoTarget-IDs, z. B. 2276 für Deutschland."
     ),
 ) -> str:
     """
