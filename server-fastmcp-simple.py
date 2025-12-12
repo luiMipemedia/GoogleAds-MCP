@@ -1,94 +1,97 @@
 #!/usr/bin/env python3
 """
-Google Ads MCP Server (FastMCP) – Keyword Ideas + Search Volume
-- No external MCP auth (trusted env only)
-- Credentials loaded from GOOGLE_ADS_OAUTH_TOKENS_BASE64 (base64-encoded JSON)
-- Uses Google Ads REST endpoints:
-  - customers:listAccessibleCustomers
-  - customers/{cid}:generateKeywordIdeas
-  - googleAds:search (GAQL) for optional tools
+Google Ads MCP Server (FastMCP) – simple keyword planner / GAQL tools.
+
+Env vars required:
+- GOOGLE_ADS_DEVELOPER_TOKEN
+- GOOGLE_ADS_OAUTH_TOKENS_BASE64  (base64-encoded JSON: {"client_id","client_secret","refresh_token"})
+- GOOGLE_ADS_LOGIN_CUSTOMER_ID    (optional; MCC login customer id, digits)
+- GOOGLE_ADS_KEYWORD_CUSTOMER_ID  (optional; customer id used for keyword planner endpoints)
 """
 
 import os
 import json
 import base64
-import logging
-import warnings
-from datetime import datetime, timezone
+import asyncio
+from typing import Any
 
-import requests
-from dateutil import parser
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request as AuthRequest
+import httpx
 
 from fastmcp import FastMCP
-from fastmcp.exceptions import ToolError
 from pydantic import Field
 
-warnings.filterwarnings("ignore")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("google_ads_mcp")
-
-SCOPES = ["https://www.googleapis.com/auth/adwords"]
-API_VERSION = "v20"
-
 # --------------------------------------------------
-# Robust credentials init
+# Config
 # --------------------------------------------------
 
-def initialize_credentials() -> Credentials:
+API_VERSION = os.environ.get("GOOGLE_ADS_API_VERSION", "v16")
+
+mcp = FastMCP("google-ads-mcp")
+
+# --------------------------------------------------
+# Errors
+# --------------------------------------------------
+
+
+class ToolError(Exception):
+    pass
+
+
+# --------------------------------------------------
+# Auth helpers
+# --------------------------------------------------
+
+
+def _load_oauth_tokens() -> dict[str, str]:
     b64 = os.environ.get("GOOGLE_ADS_OAUTH_TOKENS_BASE64")
     if not b64:
         raise ValueError("GOOGLE_ADS_OAUTH_TOKENS_BASE64 not set")
 
     try:
-        decoded = base64.b64decode(b64).decode("utf-8", errors="strict")
+        raw = base64.b64decode(b64).decode("utf-8")
+        data = json.loads(raw)
     except Exception as e:
-        raise ValueError(f"Base64 decode failed: {e}")
+        raise ValueError(f"Failed to decode GOOGLE_ADS_OAUTH_TOKENS_BASE64: {e}")
 
-    # Common pitfall: RTF accidentally encoded
-    if decoded.lstrip().startswith("{\\rtf"):
-        raise ValueError(
-            "Decoded content is RTF, not JSON. Your base64 encodes an RTF file."
-        )
+    for k in ("client_id", "client_secret", "refresh_token"):
+        if not data.get(k):
+            raise ValueError(f"Missing '{k}' in GOOGLE_ADS_OAUTH_TOKENS_BASE64 JSON")
 
-    try:
-        data = json.loads(decoded)
-    except Exception as e:
-        raise ValueError(f"JSON parse failed: {e}")
-
-    missing = [k for k in ["refresh_token", "client_id", "client_secret"] if not data.get(k)]
-    if missing:
-        raise ValueError(f"Missing required OAuth fields in JSON: {', '.join(missing)}")
-
-    creds = Credentials(
-        token=data.get("token"),  # optional
-        refresh_token=data.get("refresh_token"),
-        client_id=data.get("client_id"),
-        client_secret=data.get("client_secret"),
-        token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
-        scopes=data.get("scopes", SCOPES),
-    )
-
-    if data.get("expiry"):
-        creds.expiry = parser.parse(data["expiry"])
-
-    return creds
+    return data
 
 
-try:
-    _credentials = initialize_credentials()
-    logger.info("✅ Google Ads credentials initialized successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize Google Ads credentials: {e}")
-    _credentials = None
+class Credentials:
+    def __init__(self, token: str):
+        self.token = token
+
+
+async def _refresh_access_token() -> str:
+    data = _load_oauth_tokens()
+    token_url = "https://oauth2.googleapis.com/token"
+
+    payload = {
+        "client_id": data["client_id"],
+        "client_secret": data["client_secret"],
+        "refresh_token": data["refresh_token"],
+        "grant_type": "refresh_token",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(token_url, data=payload)
+        if r.status_code != 200:
+            raise ValueError(f"Token refresh failed: {r.status_code} {r.text}")
+        j = r.json()
+
+    token = j.get("access_token")
+    if not token:
+        raise ValueError("No access_token in OAuth response")
+
+    return token
 
 
 def get_credentials() -> Credentials:
-    if not _credentials:
-        raise ValueError("Google Ads credentials not initialized")
-    return _credentials
+    token = asyncio.get_event_loop().run_until_complete(_refresh_access_token())
+    return Credentials(token)
 
 
 def format_customer_id(cid: str) -> str:
@@ -97,16 +100,22 @@ def format_customer_id(cid: str) -> str:
     return digits.zfill(10)
 
 
+def _to_int(v):
+    """Best-effort conversion to int (handles numeric strings); returns None if not convertible."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_headers(creds: Credentials) -> dict[str, str]:
     developer_token = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
     if not developer_token:
         raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN not set")
 
-    # Refresh access token each call (safe + simple)
-    creds.refresh(AuthRequest())
-
-    headers: dict[str, str] = {
-        "Authorization": f"Bearer {creds.token}",
+    # Refresh access token in case creds were created earlier.
+    headers = {
+        "authorization": f"Bearer {creds.token}",
         "developer-token": developer_token,
         "content-type": "application/json",
     }
@@ -125,140 +134,47 @@ def get_keyword_customer_id() -> str:
     """
     cid = os.environ.get("GOOGLE_ADS_KEYWORD_CUSTOMER_ID") or os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
     if not cid:
-        raise ValueError("Missing GOOGLE_ADS_KEYWORD_CUSTOMER_ID (or GOOGLE_ADS_LOGIN_CUSTOMER_ID)")
+        raise ValueError("Set GOOGLE_ADS_KEYWORD_CUSTOMER_ID or GOOGLE_ADS_LOGIN_CUSTOMER_ID")
     return format_customer_id(cid)
 
 
-def _execute_gaql_query_internal(customer_id: str, query: str) -> str:
-    """
-    Optional GAQL helper used by get_search_terms / get_search_keywords.
-    """
+# --------------------------------------------------
+# Google Ads API helpers
+# --------------------------------------------------
+
+
+async def _post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, headers=headers, json=body)
+
+    if r.status_code >= 400:
+        raise ToolError(f"Google Ads API error {r.status_code}: {r.text}")
+
     try:
-        creds = get_credentials()
-        headers = get_headers(creds)
+        return r.json()
+    except Exception:
+        raise ToolError(f"Invalid JSON response from Google Ads API: {r.text}")
 
-        cid = format_customer_id(customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
-        resp = requests.post(url, headers=headers, json={"query": query})
-        if resp.status_code != 200:
-            return f"Error executing query: {resp.text}"
+async def _search_stream(customer_id: str, headers: dict[str, str], query: str) -> list[dict[str, Any]]:
+    url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{customer_id}/googleAds:searchStream"
+    body = {"query": query}
 
-        data = resp.json()
-        results = data.get("results") or []
-        if not results:
-            return "No results found for the query."
+    resp = await _post_json(url, headers, body)
 
-        out = [f"Query Results for Account {cid}:", "-" * 80]
-        for i, r in enumerate(results[:50], 1):
-            out.append(f"\nResult {i}:")
-            out.append(json.dumps(r, indent=2))
-        return "\n".join(out)
-
-    except Exception as e:
-        return f"Error executing GAQL query: {e}"
+    # searchStream returns a list of batches, each has results
+    out: list[dict[str, Any]] = []
+    if isinstance(resp, list):
+        for batch in resp:
+            out.extend(batch.get("results", []) or [])
+    elif isinstance(resp, dict):
+        out.extend(resp.get("results", []) or [])
+    return out
 
 
 # --------------------------------------------------
-# MCP server
+# Tools
 # --------------------------------------------------
-
-mcp = FastMCP(name="Google Ads MCP")
-
-
-@mcp.resource("health://status")
-def health_status() -> str:
-    return json.dumps(
-        {
-            "status": "ok",
-            "google_ads_connected": _credentials is not None,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
-        indent=2,
-    )
-
-
-# --------------------------------------------------
-# Tools (accounts + optional GAQL + keyword planner)
-# --------------------------------------------------
-
-@mcp.tool()
-async def list_accounts() -> str:
-    """Lists accessible Google Ads accounts for the current OAuth identity."""
-    try:
-        creds = get_credentials()
-        headers = get_headers(creds)
-
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
-        resp = requests.get(url, headers=headers)
-
-        if resp.status_code != 200:
-            raise ToolError(f"Error accessing accounts: {resp.text}")
-
-        data = resp.json()
-        names = data.get("resourceNames") or []
-        if not names:
-            return "No accessible accounts found."
-
-        lines = ["Accessible Google Ads Accounts:", "-" * 50]
-        for rn in names:
-            cid = rn.split("/")[-1]
-            lines.append(f"Account ID: {format_customer_id(cid)}")
-        return "\n".join(lines)
-
-    except Exception as e:
-        raise ToolError(str(e))
-
-
-@mcp.tool()
-async def get_search_keywords(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)."),
-    days: int = Field(default=7, description="Number of days to look back (LAST_N_DAYS)."),
-) -> str:
-    """Reads existing keyword performance from the account (GAQL keyword_view)."""
-    query = f"""
-        SELECT
-            ad_group_criterion.keyword.text,
-            campaign.name,
-            ad_group.name,
-            ad_group_criterion.keyword.match_type,
-            metrics.clicks,
-            metrics.impressions,
-            metrics.ctr,
-            metrics.average_cpc,
-            metrics.cost_micros
-        FROM keyword_view
-        WHERE segments.date DURING LAST_{days}_DAYS
-          AND ad_group_criterion.status != 'REMOVED'
-        ORDER BY metrics.impressions DESC
-        LIMIT 100
-    """
-    return _execute_gaql_query_internal(customer_id, query)
-
-
-@mcp.tool()
-async def get_search_terms(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)."),
-    days: int = Field(default=7, description="Number of days to look back (LAST_N_DAYS)."),
-) -> str:
-    """Reads actual search terms (queries) that triggered ads (GAQL search_term_view)."""
-    query = f"""
-        SELECT
-            search_term_view.search_term,
-            segments.keyword.info.match_type,
-            campaign.name,
-            ad_group.name,
-            metrics.clicks,
-            metrics.impressions,
-            metrics.ctr,
-            metrics.average_cpc,
-            metrics.cost_micros
-        FROM search_term_view
-        WHERE segments.date DURING LAST_{days}_DAYS
-        ORDER BY metrics.impressions DESC
-        LIMIT 100
-    """
-    return _execute_gaql_query_internal(customer_id, query)
 
 
 @mcp.tool()
@@ -267,13 +183,16 @@ async def generate_keyword_ideas(
     language_id: str = Field(default="1000", description="Language Constant ID (1000 = German)."),
     location_ids: list[str] = Field(default=["2276"], description="GeoTarget IDs (2276 = Germany)."),
     min_avg_monthly_searches: int = Field(default=10, description="Filter out low-volume ideas."),
-    max_results: int = Field(default=50, description="Max number of ideas returned."),
+    max_results: int = Field(default=50, description="Maximum number of ideas to return."),
 ) -> str:
     """
-    Generates NEW keyword ideas based on seed keywords (no URL).
-    Filters out the seed keywords from the result set.
+    Generate keyword ideas + basic metrics for given seed keywords.
+
+    Notes:
+    - Uses Keyword Plan Idea Service (generateKeywordIdeas endpoint).
+    - Returns a readable text response.
     """
-    if not seed_keywords or not any(s.strip() for s in seed_keywords):
+    if not seed_keywords or not any(k.strip() for k in seed_keywords):
         raise ToolError("seed_keywords must be a non-empty list of strings")
 
     try:
@@ -283,20 +202,19 @@ async def generate_keyword_ideas(
 
         endpoint = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}:generateKeywordIdeas"
 
-        seed_set = {s.lower().strip() for s in seed_keywords if s and s.strip()}
+        # Prepare request body
+        seed = [k.strip() for k in seed_keywords if k and k.strip()]
+        seed_set = {k.lower() for k in seed}
 
         body = {
             "language": f"languageConstants/{language_id}",
-            "geoTargetConstants": [f"geoTargetConstants/{l}" for l in location_ids],
-            "keywordPlanNetwork": "GOOGLE_SEARCH_AND_PARTNERS",
-            "keywordSeed": {"keywords": seed_keywords},
+            "geoTargetConstants": [f"geoTargetConstants/{lid}" for lid in location_ids],
+            "includeAdultKeywords": False,
+            "keywordSeed": {"keywords": seed},
         }
 
-        resp = requests.post(endpoint, headers=headers, json=body)
-        if resp.status_code != 200:
-            raise ToolError(resp.text)
-
-        results = resp.json().get("results") or []
+        resp = await _post_json(endpoint, headers, body)
+        results = resp.get("results") or []
         ideas: list[dict] = []
 
         for item in results:
@@ -305,14 +223,14 @@ async def generate_keyword_ideas(
                 continue
 
             metrics = item.get("keywordIdeaMetrics", {}) or {}
-            avg = metrics.get("avgMonthlySearches")
+            avg = _to_int(metrics.get("avgMonthlySearches"))
 
             # remove exact seeds
             if text.lower() in seed_set:
                 continue
 
             # volume filter
-            if avg is None or avg < min_avg_monthly_searches:
+            if avg is None or avg < int(min_avg_monthly_searches):
                 continue
 
             ideas.append(
@@ -320,24 +238,25 @@ async def generate_keyword_ideas(
                     "text": text,
                     "avg": avg,
                     "competition": metrics.get("competition"),
-                    "low_bid": metrics.get("lowTopOfPageBidMicros"),
-                    "high_bid": metrics.get("highTopOfPageBidMicros"),
+                    "low_bid": _to_int(metrics.get("lowTopOfPageBidMicros")),
+                    "high_bid": _to_int(metrics.get("highTopOfPageBidMicros")),
                 }
             )
 
         ideas.sort(key=lambda x: x["avg"], reverse=True)
+        ideas = ideas[: int(max_results)]
 
         if not ideas:
-            return "Keine neuen Keyword-Ideen gefunden (nur Seeds oder zu wenig Volumen)."
+            return "Keine Keyword-Ideen gefunden (oder alle wurden durch Filter entfernt)."
 
         out = []
-        for i in ideas[:max_results]:
+        for i, it in enumerate(ideas, start=1):
             out.append(
-                f"Keyword: {i['text']}\n"
-                f"  Avg. monthly searches: {i['avg']}\n"
-                f"  Competition: {i['competition']}\n"
-                f"  Low bid (micros): {i['low_bid']}\n"
-                f"  High bid (micros): {i['high_bid']}\n"
+                f"{i}. {it['text']}\n"
+                f"   Avg. monthly searches: {it['avg']}\n"
+                f"   Competition: {it.get('competition')}\n"
+                f"   Low bid (micros): {it.get('low_bid')}\n"
+                f"   High bid (micros): {it.get('high_bid')}\n"
             )
 
         return "\n".join(out)
@@ -354,7 +273,9 @@ async def get_keyword_search_volume(
 ) -> str:
     """
     Returns search volume + metrics for an exact keyword list.
-    (Uses generateKeywordIdeas under the hood and filters to requested keywords.)
+
+    Implementation uses the same generateKeywordIdeas endpoint and then filters results
+    to the exact keyword list.
     """
     if not keywords or not any(k.strip() for k in keywords):
         raise ToolError("keywords must be a non-empty list of strings")
@@ -370,15 +291,14 @@ async def get_keyword_search_volume(
 
         body = {
             "language": f"languageConstants/{language_id}",
-            "geoTargetConstants": [f"geoTargetConstants/{l}" for l in location_ids],
-            "keywordSeed": {"keywords": keywords},
+            "geoTargetConstants": [f"geoTargetConstants/{lid}" for lid in location_ids],
+            "includeAdultKeywords": False,
+            "keywordSeed": {"keywords": list(wanted)},
         }
 
-        resp = requests.post(endpoint, headers=headers, json=body)
-        if resp.status_code != 200:
-            raise ToolError(resp.text)
+        resp = await _post_json(endpoint, headers, body)
+        results = resp.get("results") or []
 
-        results = resp.json().get("results") or []
         out = []
 
         for item in results:
@@ -401,10 +321,42 @@ async def get_keyword_search_volume(
         raise ToolError(str(e))
 
 
+@mcp.tool()
+async def gaql_search_stream(
+    customer_id: str = Field(description="Google Ads Customer ID (digits or formatted)."),
+    query: str = Field(description="GAQL query string."),
+) -> str:
+    """
+    Run a GAQL searchStream query. Useful for optional tools and debugging.
+
+    Example query:
+      SELECT campaign.id, campaign.name FROM campaign LIMIT 10
+    """
+    if not query or not query.strip():
+        raise ToolError("query must be non-empty")
+
+    try:
+        creds = get_credentials()
+        headers = get_headers(creds)
+        cid = format_customer_id(customer_id)
+
+        results = await _search_stream(cid, headers, query.strip())
+        if not results:
+            return "No results."
+
+        # Pretty print the first N results
+        N = 20
+        shown = results[:N]
+        return json.dumps(shown, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        raise ToolError(str(e))
+
+
 # --------------------------------------------------
 # Run
 # --------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    # FastMCP will serve by default on 127.0.0.1:8000 unless configured otherwise
+    mcp.run()
